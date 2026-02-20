@@ -1,0 +1,226 @@
+
+
+df_raw = pd.read_excel(SRC)
+df_raw.columns = df_raw.columns.str.strip()
+
+def preprocess(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+
+    unnamed = [c for c in df.columns if str(c).startswith("Unnamed")]
+    if unnamed:
+        df = df.drop(columns=unnamed)
+
+    if "Wei (gr)" in df.columns:
+        df["Wei (gr)"] = (
+            df["Wei (gr)"].astype(str)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+        )
+        df["Wei (gr)"] = pd.to_numeric(df["Wei (gr)"], errors="coerce")
+
+    COL_DATE  = "date"
+    COL_START = "start"
+    COL_END   = "finish"
+    for c in [COL_DATE, COL_START, COL_END]:
+        if c not in df.columns:
+            raise ValueError(f"Missing column: {c}")
+
+    df[COL_DATE]  = pd.to_datetime(df[COL_DATE], errors="coerce")
+    df[COL_START] = df[COL_START].fillna("00:00").astype(str)
+    df[COL_END]   = df[COL_END].fillna("00:00").astype(str)
+
+    def to_td(ser):
+        s = ser.fillna("00:00:00").astype(str).str.strip()
+        s = s.apply(lambda x: x + ":00" if x.count(":") == 1 else x)
+        s = s.str.replace("0 days ", "", regex=False)
+        return pd.to_timedelta(s, errors="coerce")
+
+    df["start_td"] = to_td(df[COL_START])
+    df["end_td"]   = to_td(df[COL_END])
+
+    df["start_dt"] = df[COL_DATE] + df["start_td"]
+    df["end_dt"]   = df[COL_DATE] + df["end_td"]
+    df = df.dropna(subset=["start_dt", "end_dt"])
+
+    m = df["end_dt"] < df["start_dt"]
+    df.loc[m, "end_dt"] = df.loc[m, "end_dt"] + pd.Timedelta(days=1)
+
+    df["window_s"] = (df["end_dt"] - df["start_dt"]).dt.total_seconds()
+
+    if "Total_sec" in df.columns:
+        df["downtime_min"] = pd.to_numeric(df["Total_sec"], errors="coerce").fillna(0)
+        df = df[df["downtime_min"] <= 400].copy()
+    else:
+        df["downtime_min"] = 0.0
+
+    df["downtime_s"] = df["downtime_min"] * 60.0
+    df["work_s"] = (df["window_s"] - df["downtime_s"]).clip(lower=0)
+
+    if "Qu" not in df.columns:
+        raise ValueError("Missing column: Qu")
+    df["Qu"] = pd.to_numeric(df["Qu"], errors="coerce")
+    df = df[df["Qu"].fillna(0) > 0].copy()
+
+    if "Component" not in df.columns:
+        raise ValueError("Missing column: Component")
+    df["Component"] = df["Component"].astype(str)
+
+    df["cycle_tr"] = df["work_s"] / df["Qu"]
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["cycle_tr", "work_s", "window_s", "Qu"])
+    df = df[df["cycle_tr"] > 0].copy()
+
+    hi = df["cycle_tr"].quantile(0.995)
+    df = df[df["cycle_tr"] <= hi].copy()
+
+    df["utilization"] = np.where(df["window_s"] > 0, df["work_s"] / df["window_s"], 0.0)
+    df["start_hour"] = df["start_dt"].dt.hour.astype("Int64")
+    df["weekday"] = df["start_dt"].dt.weekday.astype("Int64")
+    df["month"] = df["start_dt"].dt.month.astype("Int64")
+    return df
+
+df = preprocess(df_raw)
+print("Rows:", len(df), "| Unique components:", df["Component"].nunique())
+
+candidate_cat = ["Machine", "Por", "Device", "Raw", "Sect"]
+cat_cols = [c for c in candidate_cat if c in df.columns]
+
+# numeric columns to concatenate (IMPORTANT: must be numeric and stable)
+candidate_num = ["Wei (gr)", "Wei", "Qu", "downtime_min", "window_s", "work_s", "utilization", "start_hour", "weekday", "month"]
+num_cols = [c for c in candidate_num if c in df.columns]
+
+def row_to_text(row):
+    parts = []
+    for c in cat_cols:
+        v = row[c]
+        parts.append(f"{c}={('missing' if pd.isna(v) else str(v))}")
+    return ", ".join(parts) if parts else "no_cats"
+
+texts = df.apply(row_to_text, axis=1).tolist()
+
+X_num = df[num_cols].copy() if num_cols else pd.DataFrame(index=df.index)
+for c in X_num.columns:
+    X_num[c] = pd.to_numeric(X_num[c], errors="coerce")
+    X_num[c] = X_num[c].fillna(X_num[c].median())
+X_num = X_num.to_numpy(dtype=np.float32) if len(X_num.columns) else np.zeros((len(df), 0), dtype=np.float32)
+
+y_cycle = df["cycle_tr"].values.astype(np.float64)
+y_log = np.log1p(y_cycle)
+
+groups = df["Component"].values
+gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+train_idx, test_idx = next(gss.split(np.zeros(len(df)), y_log, groups=groups))
+
+X_train_text = [texts[i] for i in train_idx]
+X_test_text  = [texts[i] for i in test_idx]
+X_num_train = X_num[train_idx]
+X_num_test  = X_num[test_idx]
+
+y_train = y_log[train_idx]
+y_test  = y_log[test_idx]
+y_cycle_test = y_cycle[test_idx]
+
+def smape(y_true, y_pred, eps=1e-9):
+    denom = (np.abs(y_true) + np.abs(y_pred) + eps)
+    return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100.0)
+
+def rmse(y_true, y_pred):
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+def load_4bit(model_id: str):
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16
+    )
+    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    mdl = AutoModel.from_pretrained(
+        model_id,
+        device_map="auto",
+        quantization_config=bnb,
+        torch_dtype=torch.float16,
+        trust_remote_code=False
+    )
+    mdl.eval()
+    return tok, mdl
+
+@torch.no_grad()
+def embed_meanpool(text_list, tok, mdl, batch_size=8, max_len=256):
+    vecs = []
+    for i in range(0, len(text_list), batch_size):
+        batch = text_list[i:i+batch_size]
+        enc = tok(batch, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+        enc = {k: v.to(mdl.device) for k, v in enc.items()}
+
+        out = mdl(**enc)
+        last = out.last_hidden_state
+        mask = enc["attention_mask"].unsqueeze(-1).to(last.dtype)
+        pooled = (last * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+        pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
+        vecs.append(pooled.detach().cpu().numpy())
+
+    return np.vstack(vecs).astype(np.float32)
+
+def run_llm_concat(model_id: str, batch_size: int, max_len: int):
+    tok, mdl = load_4bit(model_id)
+
+    E_train = embed_meanpool(X_train_text, tok, mdl, batch_size=batch_size, max_len=max_len)
+    E_test  = embed_meanpool(X_test_text,  tok, mdl, batch_size=batch_size, max_len=max_len)
+
+    Xtr = np.hstack([E_train, X_num_train])
+    Xte = np.hstack([E_test,  X_num_test])
+
+    results = []
+
+    ridge = Ridge(alpha=10.0, random_state=42)
+    ridge.fit(Xtr, y_train)
+    pred_cycle = np.expm1(ridge.predict(Xte))
+    results.append({
+        "llm": model_id,
+        "head": "Ridge",
+        "embed_dim": int(E_train.shape[1]),
+        "num_dim": int(X_num_train.shape[1]),
+        "Holdout_RMSE_sec": rmse(y_cycle_test, pred_cycle),
+        "Holdout_sMAPE_%": smape(y_cycle_test, pred_cycle),
+        "Holdout_R2": float(r2_score(y_cycle_test, pred_cycle)),
+        "batch_size": batch_size,
+        "max_len": max_len
+    })
+
+    # HistGBDT
+    hgb = HistGradientBoostingRegressor(
+        learning_rate=0.05,
+        max_leaf_nodes=63,
+        min_samples_leaf=20,
+        random_state=42
+    )
+    hgb.fit(Xtr, y_train)
+    pred_cycle2 = np.expm1(hgb.predict(Xte))
+    results.append({
+        "llm": model_id,
+        "head": "HistGBDT",
+        "embed_dim": int(E_train.shape[1]),
+        "num_dim": int(X_num_train.shape[1]),
+        "Holdout_RMSE_sec": rmse(y_cycle_test, pred_cycle2),
+        "Holdout_sMAPE_%": smape(y_cycle_test, pred_cycle2),
+        "Holdout_R2": float(r2_score(y_cycle_test, pred_cycle2)),
+        "batch_size": batch_size,
+        "max_len": max_len
+    })
+
+    return results
+
+
+models = [
+    ("mistralai/Mistral-7B-Instruct-v0.3", 8, 256),
+    ("google/gemma-2-9b-it", 4, 256),
+]
+
+all_rows = []
+for mid, bs, ml in models:
+    try:
+        all_rows.extend(run_llm_concat(mid, batch_size=bs, max_len=ml))
+    except Exception as e:
+        print("FAILED:", mid)

@@ -1,0 +1,16 @@
+!pip -q install -U transformers accelerate bitsandbytes sentencepiece huggingface_hub scikit-learn pandas openpyxl
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
+from huggingface_hub import login
+!pip -q install catboost
+import numpy as np
+import pandas as pd
+from catboost import CatBoostRegressor, Pool
+from sklearn.model_selection import GroupShuffleSplit, GroupKFold
+from sklearn.metrics import mean_squared_error, r2_score

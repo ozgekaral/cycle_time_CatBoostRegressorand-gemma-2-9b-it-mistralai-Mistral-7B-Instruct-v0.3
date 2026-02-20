@@ -1,0 +1,199 @@
+
+uploaded = files.upload()
+df_raw = pd.read_excel(SRC_PROD)
+df_raw.columns = df_raw.columns.str.strip()
+
+def preprocess(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    unnamed = [c for c in df.columns if str(c).startswith("Unnamed")]
+    if unnamed:
+        df = df.drop(columns=unnamed)
+    if "Wei (gr)" in df.columns:
+        df["Wei (gr)"] = (
+            df["Wei (gr)"].astype(str)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+        )
+        df["Wei (gr)"] = pd.to_numeric(df["Wei (gr)"], errors="coerce")
+
+    COL_DATE  = "Date"
+    COL_START = "Start"
+    COL_END   = "Finish"
+    for c in [COL_DATE, COL_START, COL_END]:
+        if c not in df.columns:
+            raise ValueError(f"fail: {c}")
+
+    df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+    df[COL_START] = df[COL_START].fillna("00:00").astype(str)
+    df[COL_END]   = df[COL_END].fillna("00:00").astype(str)
+
+    def to_td(ser):
+        s = ser.fillna("00:00:00").astype(str).str.strip()
+        s = s.apply(lambda x: x + ":00" if x.count(":") == 1 else x)
+        s = s.str.replace("0 days ", "", regex=False)
+        return pd.to_timedelta(s, errors="coerce")
+
+    df["start_td"] = to_td(df[COL_START])
+    df["end_td"]   = to_td(df[COL_END])
+
+    df["start_dt"] = df[COL_DATE] + df["start_td"]
+    df["end_dt"]   = df[COL_DATE] + df["end_td"]
+    df = df.dropna(subset=["start_dt", "end_dt"])
+
+    m = df["end_dt"] < df["start_dt"]
+    df.loc[m, "end_dt"] = df.loc[m, "end_dt"] + pd.Timedelta(days=1)
+
+    df["window_s"] = (df["end_dt"] - df["start_dt"]).dt.total_seconds()
+
+    if "Total_sec" in df.columns:
+        df["downtime_min"] = pd.to_numeric(df["Total_sec"], errors="coerce").fillna(0)
+        df = df[df["downtime_min"] <= 400].copy()
+    else:
+        df["downtime_min"] = 0.0
+
+    df["downtime_s"] = df["downtime_min"] * 60.0
+    df["work_s"] = (df["window_s"] - df["downtime_s"]).clip(lower=0)
+
+    if "Qu" in df.columns:
+        df["Qu"] = pd.to_numeric(df["Qu"], errors="coerce")
+    elif "Qu" in df.columns:
+        df["Qu"] = pd.to_numeric(df["Qu"], errors="coerce")
+    else:
+        raise ValueError("fail")
+
+    df = df[df["Qu"].fillna(0) > 0].copy()
+
+    if "Component" not in df.columns:
+        raise ValueError("fail")
+    df["Component"] = df["Component"].astype(str)
+
+    df["cycle_tr"] = df["work_s"] / df["Qu"]
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["cycle_tr", "work_s", "window_s", "Qu"])
+    df = df[df["cycle_tr"] > 0].copy()
+    
+hi = df["cycle_tr"].quantile(0.995)
+    df = df[df["cycle_tr"] <= hi].copy()
+
+    df["utilization"] = np.where(df["window_s"] > 0, df["work_s"] / df["window_s"], 0.0)
+    df["start_hour"] = df["start_dt"].dt.hour.astype("Int64")
+    df["weekday"] = df["start_dt"].dt.weekday.astype("Int64")
+    df["month"] = df["start_dt"].dt.month.astype("Int64")
+
+    return df
+
+df = preprocess(df_raw)
+
+def smape(y_true, y_pred, eps=1e-9):
+    denom = (np.abs(y_true) + np.abs(y_pred) + eps)
+    return np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100.0
+
+candidate_cat = ["Machine", "Por", "Device", "Raw", "Sect"]
+cat_cols = [c for c in candidate_cat if c in df.columns]
+
+num_cols = []
+for c in ["Wei", "Qu", "downtime_min", "window_s", "work_s", "utilization", "start_hour", "weekday", "month"]:
+    if c in df.columns:
+        num_cols.append(c)
+
+features = num_cols + cat_cols
+X = df[features].copy()
+groups = df["Component"].astype(str)
+
+for c in num_cols:
+    X[c] = pd.to_numeric(X[c], errors="coerce")
+    X[c] = X[c].fillna(X[c].median())
+
+for c in cat_cols:
+    X[c] = X[c].astype(str).fillna("missing")
+
+y = np.log1p(df["cycle_true"].values)
+
+gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+train_idx, test_idx = next(gss.split(X, y, groups=groups))
+
+X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+y_train, y_test = y[train_idx], y[test_idx]
+
+groups_train = groups.iloc[train_idx]
+groups_test  = groups.iloc[test_idx]
+
+cycle_test_true = df.iloc[test_idx]["cycle_true"].values
+
+cv = GroupKFold(n_splits=3)
+
+cat_features_idx = [X_train.columns.get_loc(c) for c in cat_cols]
+
+param_candidates = [
+    dict(depth=6, learning_rate=0.08, l2_leaf_reg=6, iterations=2000),
+    dict(depth=8, learning_rate=0.06, l2_leaf_reg=8, iterations=2500),
+    dict(depth=10, learning_rate=0.04, l2_leaf_reg=10, iterations=3000),
+    dict(depth=7, learning_rate=0.07, l2_leaf_reg=5, iterations=2200),
+]
+
+def cv_score_smape(params):
+    fold_scores = []
+    for tr, va in cv.split(X_train, y_train, groups=groups_train):
+        tr_pool = Pool(X_train.iloc[tr], y_train[tr], cat_features=cat_features_idx)
+        va_pool = Pool(X_train.iloc[va], y_train[va], cat_features=cat_features_idx)
+
+        model = CatBoostRegressor(
+            loss_function="MAE",        
+            eval_metric="MAE",
+            random_seed=42,
+            verbose=False,
+            **params
+        )
+        model.fit(
+            tr_pool,
+            eval_set=va_pool,
+            use_best_model=True,
+            early_stopping_rounds=200
+        )
+
+        pred_log = model.predict(va_pool)
+        pred_cycle = np.expm1(pred_log)
+        true_cycle = np.expm1(y_train[va])
+        fold_scores.append(smape(true_cycle, pred_cycle))
+    return float(np.mean(fold_scores))
+
+best_params = None
+best_cv_smape = 1e9
+
+for p in param_candidates:
+    score = cv_score_smape(p)
+    print("params:", p, "CV sMAPE(%):", round(score, 2))
+    if score < best_cv_smape:
+        best_cv_smape = score
+        best_params = p
+train_pool = Pool(X_train, y_train, cat_features=cat_features_idx)
+test_pool  = Pool(X_test,  y_test,  cat_features=cat_features_idx)
+
+final_model = CatBoostRegressor(
+    loss_function="MAE",
+    eval_metric="MAE",
+    random_seed=42,
+    verbose=200,
+    **best_params
+)
+
+final_model.fit(train_pool, eval_set=test_pool, use_best_model=True, early_stopping_rounds=200)
+
+pred_log = final_model.predict(test_pool)
+cycle_pred = np.expm1(pred_log)
+
+rmse = mean_squared_error(cycle_test_true, cycle_pred) ** 0.5
+smap = smape(cycle_test_true, cycle_pred)
+r2   = r2_score(cycle_test_true, cycle_pred)
+
+print("\n=== HOLDOUT RESULTS (cycle_true) ===")
+print(f"RMSE (sec) : {rmse:.3f}")
+print(f"sMAPE (%)  : {smap:.2f}")
+print(f"R2         : {r2:.4f}")
+
+out = df.iloc[test_idx][["component","cycle_tr"]].copy()
+out["cycle_pred"] = cycle_pred
+out["abs_err"] = np.abs(out["cycle_tr"] - out["cycle_pred"])
+out["ape_%"] = (out["abs_err"] / np.maximum(np.abs(out["cycle_tr"]), 1e-9)) * 100.0
+out = out.sort_values("abs_err", ascending=False)

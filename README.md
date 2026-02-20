@@ -1,4 +1,4 @@
-# cycle_time_CatBoostRegressorand-gemma-2-9b-it-mistralai-Mistral-7B-Instruct-v0.3
+# Cycle_time_CatBoostRegressorand-gemma-2-9b-it-mistralai-Mistral-7B-Instruct-v0.3
 
 I compared two approaches to predict true cycle time (sec/part) from manufacturing data.
 

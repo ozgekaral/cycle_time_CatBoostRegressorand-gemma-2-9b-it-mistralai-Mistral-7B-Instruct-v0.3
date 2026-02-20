@@ -5,7 +5,7 @@ I compared two approaches to predict true cycle time (sec/part) from manufacturi
 First, I engineered the target directly from raw shop-floor logs:
 I cleaned the data (removed zero-quantity rows, filtered extreme downtime, trimmed outliers), and—most importantly—prevented part-level leakage by using GroupShuffleSplit + GroupKFold. This way, the test set truly represents the real-life “new part” generalization scenario.
 
-<img src="img/cycle_per.png" width="350" alt="performance"> <img src="img/cycle_perfor.png" width="350" alt="performance"> 
+<img src="images/cycle_per.png" width="350" alt="performance"> <img src="images/cycle_perfor.png" width="350" alt="performance"> 
 
 With tabular ML (CatBoostRegressor), the results were very strong:
 RMSE ≈ 2.99 sec, sMAPE ≈ 0.89%, R² ≈ 0.9946.
